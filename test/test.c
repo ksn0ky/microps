@@ -10,6 +10,7 @@
 #include "icmp.h"
 
 #include "driver/loopback.h"
+#include "driver/ether_tap.h"
 
 #include "test.h"
 
@@ -53,6 +54,20 @@ setup(void)
         errorf("ip_iface_register() failure");
         return -1;
     }
+    dev = ether_tap_init(ETHER_TAP_NAME, ETHER_TAP_HW_ADDR);
+    if (!dev) {
+        errorf("ether_tap_init() failure");
+        return -1;
+    }
+    iface = ip_iface_alloc(ETHER_TAP_IP_ADDR, ETHER_TAP_NETMASK);
+    if (!iface) {
+        errorf("ip_iface_alloc() failure");
+        return -1;
+    }
+    if (ip_iface_register(dev, iface) == -1) {
+        errorf("ip_iface_register() failure");
+        return -1;
+    }
     if (net_run() == -1) {
         errorf("net_run() failure");
         return -1;
@@ -74,21 +89,8 @@ cleanup(void)
 static int
 app_main(void)
 {
-    ip_addr_t src, dst;
-    uint16_t id, seq = 0;
-    uint32_t val;
-    uint8_t data[] = {'T', 'E', 'S', 'T'};
-
-    ip_addr_pton(LOOPBACK_IP_ADDR, &src);
-    dst = src;
-    id = getpid() % UINT16_MAX;
     debugf("press Ctrl+C to terminate");
     while (!terminate) {
-        val = hton32(id << 16 | ++seq);
-        if (icmp_output(ICMP_TYPE_ECHO, 0, val, data, sizeof(data), src, dst) == -1) {
-            errorf("icmp_output() failure");
-            break;
-        }
         sleep(1);
     }
     debugf("terminate");
