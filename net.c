@@ -190,6 +190,7 @@ net_input(uint16_t type, const uint8_t *data, size_t len, struct net_device *dev
     return 0;
 }
 
+#include "arp.h"
 #include "ip.h"
 #include "icmp.h"
 
@@ -199,6 +200,10 @@ net_init(void)
     infof("initialize...");
     if (platform_init() == -1) {
         errorf("platform_init() failure");
+        return -1;
+    }
+    if (arp_init() == -1) {
+        errorf("arp_init() failure");
         return -1;
     }
     if (ip_init() == -1) {
