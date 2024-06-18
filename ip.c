@@ -95,7 +95,7 @@ ip_endp_pton(const char *p, ip_endp_t *n)
         return -1;
     }
     port = strtol(sep+1, NULL, 10);
-    if (port <= 0 || port > UINT16_MAX) {
+    if (port < 0 || port > UINT16_MAX) {
         return -1;
     }
     n->port = hton16(port);
