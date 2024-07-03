@@ -542,6 +542,15 @@ tcp_segment_arrives(struct seg_info *seg, uint8_t flags, const uint8_t *data, si
         /*
          * 1st check the ACK bit
          */
+        if (TCP_FLG_ISSET(flags, TCP_FLG_ACK)) {
+            if (seg->ack <= pcb->iss || seg->ack > pcb->snd.nxt) {
+                tcp_output_segment(seg->ack, 0, TCP_FLG_RST, 0, NULL, 0, local, remote);
+                return;
+            }
+            if (pcb->snd.una <= seg->ack && seg->ack <= pcb->snd.nxt) {
+                acceptable = 1;
+            }
+        }
 
         /*
          * 2nd check the RST bit
@@ -554,6 +563,27 @@ tcp_segment_arrives(struct seg_info *seg, uint8_t flags, const uint8_t *data, si
         /*
          * 4th check the SYN bit
          */
+        if (TCP_FLG_ISSET(flags, TCP_FLG_SYN)) {
+            pcb->rcv.nxt = seg->seq + 1;
+            pcb->irs = seg->seq;
+            if (acceptable) {
+                pcb->snd.una = seg->ack;
+                tcp_retrans_queue_cleanup(pcb);
+            }
+            if (pcb->snd.una > pcb->iss) {
+                TCP_STATE_CHANGE(pcb, TCP_STATE_ESTABLISHED);
+                tcp_output(pcb, TCP_FLG_ACK, NULL, 0);
+                /* NOTE: not specified in the RFC793, but send window initialization required */
+                pcb->snd.wnd = seg->wnd;
+                pcb->snd.wl1 = seg->seq;
+                pcb->snd.wl2 = seg->ack;
+                sched_task_wakeup(&pcb->task);
+                /* ignore: continue processing at the sixth step below where the URG bit is checked */
+                return;
+            } else {
+                /* TODO: simultaneous open */
+            }
+        }
 
         /*
          * 5th, if neither of the SYN or RST bits is set then drop the segment and return
@@ -791,6 +821,8 @@ tcp_cmd_open(ip_endp_t local, ip_endp_t remote, int active)
     struct tcp_pcb *pcb;
     char ep1[IP_ENDP_STR_LEN];
     char ep2[IP_ENDP_STR_LEN];
+    char addr[IP_ADDR_STR_LEN];
+    uint32_t p;
     int state, desc;
     struct ip_iface *iface;
 
@@ -806,10 +838,53 @@ tcp_cmd_open(ip_endp_t local, ip_endp_t remote, int active)
         ip_endp_ntop(local, ep1, sizeof(ep1)),
         ip_endp_ntop(remote, ep2, sizeof(ep2)));
     if (active) {
-        errorf("active open does not implement");
-        tcp_pcb_release(pcb);
-        lock_release(&lock);
-        return -1;
+        if (local.addr == IP_ADDR_ANY) {
+            iface = ip_route_get_iface(remote.addr);
+            if (!iface) {
+                errorf("iface not found that can reach remote address, addr=%s",
+                    ip_addr_ntop(remote.addr, addr, sizeof(addr)));
+                lock_release(&lock);
+                return -1;
+            }
+            local.addr = iface->unicast;
+            debugf("select local address, addr=%s",
+                ip_addr_ntop(local.addr, addr, sizeof(addr)));
+        }
+        if (!local.port) {
+            for (p = IP_ENDP_DYNAMIC_PORT_MIN; p <= IP_ENDP_DYNAMIC_PORT_MAX; p++) {
+                local.port = hton16(p);
+                if (!tcp_pcb_select(local, remote)) {
+                    debugf("dinamic assign local port, port=%d", ntoh16(local.port));
+                    break;
+                }
+            }
+            if (IP_ENDP_DYNAMIC_PORT_MAX < p) {
+                debugf("failed to dinamic assign local port, addr=%s",
+                    ip_addr_ntop(local.addr, addr, sizeof(addr)));
+                lock_release(&lock);
+                return -1;
+            }
+        }
+        if (tcp_pcb_select(local, remote)) {
+            errorf("address already in use");
+            tcp_pcb_release(pcb);
+            lock_release(&lock);
+            return -1;
+        }
+        pcb->local = local;
+        pcb->remote = remote;
+        pcb->rcv.wnd = sizeof(pcb->buf);
+        pcb->iss = random();
+        if (tcp_output(pcb, TCP_FLG_SYN, NULL, 0) == -1) {
+            errorf("tcp_output() failure");
+            TCP_STATE_CHANGE(pcb, TCP_STATE_CLOSED);
+            tcp_pcb_release(pcb);
+            lock_release(&lock);
+            return -1;
+        }
+        pcb->snd.una = pcb->iss;
+        pcb->snd.nxt = pcb->iss + 1;
+        TCP_STATE_CHANGE(pcb, TCP_STATE_SYN_SENT);
     } else {
         if (tcp_pcb_select(local, remote)) {
             errorf("address already in use");
