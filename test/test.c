@@ -136,6 +136,7 @@ main(void)
         return -1;
     }
     ret = app_main();
+    sleep(1);
     if (cleanup() == -1) {
         errorf("cleanup() failure");
         return -1;
