@@ -47,6 +47,9 @@
         (x)->state = (y);               \
     } while (0);
 
+#define TCP_DEFAULT_RTO 200000 /* micro seconds */
+#define TCP_RETRANS_DEADLINE 12 /* seconds */
+
 struct pseudo_hdr {
     uint32_t src;
     uint32_t dst;
@@ -93,6 +96,17 @@ struct tcp_pcb {
     uint16_t mss;
     uint8_t buf[65535]; /* receive buffer */
     struct sched_task task;
+};
+
+struct tcp_queue_entry {
+    struct queue_entry entry;
+    struct timeval first;
+    struct timeval last;
+    unsigned int rto; /* micro seconds */
+    uint32_t seq;
+    uint8_t flg;
+    size_t len;
+    /* data bytes exists after this structure. */
 };
 
 struct seg_info {
@@ -344,6 +358,27 @@ tcp_output_segment(uint32_t seq, uint32_t ack, uint8_t flg, uint16_t wnd,
         return -1;
     }
     return len;
+}
+
+/*
+ * TCP Retransmit
+ *
+ * NOTE: TCP Retransmit functions must be called after locked
+ */
+
+static int
+tcp_retrans_queue_add(struct tcp_pcb *pcb, uint32_t seq, uint8_t flg, const uint8_t *data, size_t len)
+{
+}
+
+static void
+tcp_retrans_queue_cleanup(struct tcp_pcb *pcb)
+{
+}
+
+static void
+tcp_retrans_emit(void *arg, struct queue_entry *_entry)
+{
 }
 
 static ssize_t
@@ -639,6 +674,11 @@ tcp_input(const struct ip_hdr *iphdr, const uint8_t *data, size_t len, struct ip
     tcp_segment_arrives(&seg, hdr->flg, (uint8_t *)hdr + hlen, len - hlen, dst, src);
     lock_release(&lock);
     return;
+}
+
+static void
+tcp_timer(void)
+{
 }
 
 int
