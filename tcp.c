@@ -25,6 +25,8 @@
 
 #define TCP_PCB_SIZE 16
 
+#define TCP_PCB_MODE_SOCKET 1
+
 #define TCP_STATE_NONE         0
 #define TCP_STATE_CLOSED       1
 #define TCP_STATE_LISTEN       2
@@ -87,7 +89,9 @@ struct rcv_vars {
 };
 
 struct tcp_pcb {
+    struct queue_entry entry; /* for backlog */
     int state;
+    int mode;
     ip_endp_t local;
     ip_endp_t remote;
     struct snd_vars snd;
@@ -99,6 +103,9 @@ struct tcp_pcb {
     struct sched_task task;
     struct queue queue; /* retransmit queue */
     struct timeval tw_timer;
+    struct tcp_pcb *parent;
+    struct queue backlog;
+    int backlog_max;
 };
 
 struct tcp_queue_entry {
@@ -298,6 +305,13 @@ tcp_pcb_release(struct tcp_pcb *pcb)
         debugf("free queue entry");
         memory_free(entry);
     }
+    while (1) {
+        entry = queue_pop(&pcb->backlog);
+        if (!entry) {
+            break;
+        }
+        tcp_pcb_release((struct tcp_pcb *)entry);
+    }
     memset(pcb, 0, sizeof(*pcb));
     debugf("successs, desc=%d", tcp_pcb_desc(pcb));
 }
@@ -486,7 +500,7 @@ static void
 tcp_segment_arrives(struct seg_info *seg, uint8_t flags, const uint8_t *data, size_t len,
                     ip_endp_t local, ip_endp_t remote)
 {
-    struct tcp_pcb *pcb;
+    struct tcp_pcb *pcb, *new_pcb;
     int acceptable = 0;
 
     pcb = tcp_pcb_select(local, remote);
@@ -526,6 +540,19 @@ tcp_segment_arrives(struct seg_info *seg, uint8_t flags, const uint8_t *data, si
         */
         if (TCP_FLG_ISSET(flags, TCP_FLG_SYN)) {
             /* ignore: security/compartment check */
+            if (pcb->mode == TCP_PCB_MODE_SOCKET) {
+                if (pcb->backlog_max < (int)pcb->backlog.num) {
+                    warnf("backlog is full");
+                    return;
+                }
+                new_pcb = tcp_pcb_alloc();
+                if (!new_pcb) {
+                    errorf("tcp_pcb_alloc() failure");
+                    return;
+                }
+                new_pcb->parent = pcb;
+                pcb = new_pcb;
+            }
             pcb->local = local;
             pcb->remote = remote;
             pcb->rcv.wnd = sizeof(pcb->buf);
@@ -741,6 +768,10 @@ tcp_segment_arrives(struct seg_info *seg, uint8_t flags, const uint8_t *data, si
         if (pcb->snd.una <= seg->ack && seg->ack <= pcb->snd.nxt) {
             TCP_STATE_CHANGE(pcb, TCP_STATE_ESTABLISHED);
             sched_task_wakeup(&pcb->task);
+            if (pcb->parent) {
+                queue_push(&pcb->parent->backlog, (struct queue_entry *)pcb);
+                sched_task_wakeup(&pcb->parent->task);
+            }
         } else {
             tcp_output_segment(seg->ack, 0, TCP_FLG_RST, 0, NULL, 0, local, remote);
             return;
@@ -1110,6 +1141,20 @@ AGAIN:
 int
 tcp_cmd_socket(void)
 {
+    struct tcp_pcb *pcb;
+    int desc;
+
+    lock_acquire(&lock);
+    pcb = tcp_pcb_alloc();
+    if (!pcb) {
+        errorf("tcp_pcb_alloc() failure");
+        lock_release(&lock);
+        return -1;
+    }
+    pcb->mode = TCP_PCB_MODE_SOCKET;
+    desc = tcp_pcb_desc(pcb);
+    lock_release(&lock);
+    return desc;
 }
 
 int
@@ -1172,21 +1217,229 @@ tcp_cmd_close(int desc)
 int
 tcp_cmd_connect(int desc, ip_endp_t remote)
 {
+    struct tcp_pcb *pcb;
+    ip_endp_t local;
+    struct ip_iface *iface;
+    char ep1[IP_ENDP_STR_LEN];
+    char ep2[IP_ENDP_STR_LEN];
+    char addr[IP_ADDR_STR_LEN];
+    uint32_t p;
+    int state;
+
+    lock_acquire(&lock);
+    pcb = tcp_pcb_get(desc);
+    if (!pcb) {
+        errorf("pcb not found");
+        lock_release(&lock);
+        return -1;
+    }
+    local = pcb->local;
+    debugf("local=%s, remote=%s",
+        ip_endp_ntop(local, ep1, sizeof(ep1)),
+        ip_endp_ntop(remote, ep2, sizeof(ep2)));
+    if (local.addr == IP_ADDR_ANY) {
+        iface = ip_route_get_iface(remote.addr);
+        if (!iface) {
+            errorf("iface not found that can reach remote address, addr=%s",
+                ip_addr_ntop(remote.addr, addr, sizeof(addr)));
+            lock_release(&lock);
+            return -1;
+        }
+        local.addr = iface->unicast;
+        debugf("select local address, addr=%s",
+            ip_addr_ntop(local.addr, addr, sizeof(addr)));
+    }
+    if (!local.port) {
+        for (p = IP_ENDP_DYNAMIC_PORT_MIN; p <= IP_ENDP_DYNAMIC_PORT_MAX; p++) {
+            local.port = hton16(p);
+            if (!tcp_pcb_select(local, remote)) {
+                debugf("dinamic assign local port, port=%d", ntoh16(local.port));
+                break;
+            }
+        }
+        if (IP_ENDP_DYNAMIC_PORT_MAX < p) {
+            debugf("failed to dinamic assign local port, addr=%s",
+                ip_addr_ntop(local.addr, addr, sizeof(addr)));
+            lock_release(&lock);
+            return -1;
+        }
+    }
+    if (tcp_pcb_select(local, remote)) {
+        errorf("address already in use");
+        tcp_pcb_release(pcb);
+        lock_release(&lock);
+        return -1;
+    }
+    pcb->local = local;
+    pcb->remote = remote;
+    pcb->rcv.wnd = sizeof(pcb->buf);
+    pcb->iss = random();
+    if (tcp_output(pcb, TCP_FLG_SYN, NULL, 0) == -1) {
+        errorf("tcp_output() failure");
+        TCP_STATE_CHANGE(pcb, TCP_STATE_CLOSED);
+        tcp_pcb_release(pcb);
+        lock_release(&lock);
+        return -1;
+    }
+    pcb->snd.una = pcb->iss;
+    pcb->snd.nxt = pcb->iss + 1;
+    TCP_STATE_CHANGE(pcb, TCP_STATE_SYN_SENT);
+AGAIN:
+    state = pcb->state;
+    /* waiting for state changed */
+    while (pcb->state == state) {
+        if (sched_task_sleep(&pcb->task, &lock, NULL) == -1) {
+            debugf("interrupted");
+            pcb->state = TCP_STATE_CLOSED;
+            tcp_pcb_release(pcb);
+            lock_release(&lock);
+            errno = EINTR;
+            return -1;
+        }
+    }
+    if (pcb->state != TCP_STATE_ESTABLISHED) {
+        if (pcb->state == TCP_STATE_SYN_RECEIVED) {
+            goto AGAIN;
+        }
+        errorf("open error: state=%s (%d)", tcp_state_ntoa(pcb->state), pcb->state);
+        pcb->state = TCP_STATE_CLOSED;
+        tcp_pcb_release(pcb);
+        lock_release(&lock);
+        return -1;
+    }
+    iface = ip_route_get_iface(pcb->remote.addr);
+    if (!iface) {
+        errorf("iface not found");
+        lock_release(&lock);
+        return -1;
+    }
+    pcb->mss = NET_IFACE(iface)->dev->mtu - (IP_HDR_SIZE_MIN + sizeof(struct tcp_hdr));
+    debugf("success, local=%s, remote=%s",
+        ip_endp_ntop(pcb->local, ep1, sizeof(ep1)),
+        ip_endp_ntop(pcb->remote, ep2, sizeof(ep2)));
+    lock_release(&lock);
+    return 0;
 }
 
 int
 tcp_cmd_bind(int desc, ip_endp_t local)
 {
+    struct tcp_pcb *pcb, *exist;
+    ip_endp_t remote = {IP_ADDR_ANY, 0};
+    char ep[IP_ENDP_STR_LEN];
+
+    lock_acquire(&lock);
+    pcb = tcp_pcb_get(desc);
+    if (!pcb) {
+        errorf("pcb not found");
+        lock_release(&lock);
+        return -1;
+    }
+    if (local.port == 0){
+        errorf("invliad port");
+        lock_release(&lock);
+        return -1;
+    }
+    if (pcb->state != TCP_STATE_CLOSED) {
+        errorf("pcb is not CLOSED state");
+        lock_release(&lock);
+        return -1;
+    }
+    exist = tcp_pcb_select(local, remote);
+    if (exist) {
+        errorf("already bound, exist=%s", ip_endp_ntop(exist->local, ep, sizeof(ep)));
+        lock_release(&lock);
+        return -1;
+    }
+    pcb->local = local;
+    debugf("success: local=%s", ip_endp_ntop(pcb->local, ep, sizeof(ep)));
+    lock_release(&lock);
+    return 0;
 }
 
 int
 tcp_cmd_listen(int desc, int backlog)
 {
+    struct tcp_pcb *pcb;
+
+    lock_acquire(&lock);
+    pcb = tcp_pcb_get(desc);
+    if (!pcb) {
+        errorf("pcb not found");
+        lock_release(&lock);
+        return -1;
+    }
+    if (pcb->local.port == 0){
+        errorf("pcb is not bound");
+        lock_release(&lock);
+        return -1;
+    }
+    if (pcb->state != TCP_STATE_CLOSED) {
+        errorf("pcb is not CLOSED state");
+        lock_release(&lock);
+        return -1;
+    }
+    pcb->backlog_max = backlog;
+    TCP_STATE_CHANGE(pcb, TCP_STATE_LISTEN);
+    lock_release(&lock);
+    return 0;
 }
 
 int
 tcp_cmd_accept(int desc, ip_endp_t *remote)
 {
+    struct tcp_pcb *pcb, *new_pcb;
+    struct ip_iface *iface;
+    int new_desc;
+    char ep1[IP_ENDP_STR_LEN];
+    char ep2[IP_ENDP_STR_LEN];
+
+    lock_acquire(&lock);
+    pcb = tcp_pcb_get(desc);
+    if (!pcb) {
+        errorf("pcb not found");
+        lock_release(&lock);
+        return -1;
+    }
+    if (pcb->state != TCP_STATE_LISTEN) {
+        errorf("not in LISTEN state");
+        lock_release(&lock);
+        return -1;
+    }
+    while (1) {
+        new_pcb = (struct tcp_pcb *)queue_pop(&pcb->backlog);
+        if (new_pcb) {
+            break;
+        }
+        if (sched_task_sleep(&pcb->task, &lock, NULL) != 0) {
+            debugf("interrupted");
+            lock_release(&lock);
+            errno = EINTR;
+            return -1;
+        }
+        if (pcb->state == TCP_STATE_CLOSED) {
+            debugf("closed");
+            tcp_pcb_release(pcb);
+            lock_release(&lock);
+            return -1;
+        }
+    }
+    if (remote) {
+        *remote = new_pcb->remote;
+    }
+    iface = ip_route_get_iface(new_pcb->remote.addr);
+    if (!iface) {
+        errorf("ip_route_get_iface() failure");
+        lock_release(&lock);
+        return -1;
+    }
+    new_pcb->mss = NET_IFACE(iface)->dev->mtu - (IP_HDR_SIZE_MIN + sizeof(struct tcp_hdr));
+    new_desc = tcp_pcb_desc(new_pcb);
+    debugf("success: local=%s, remote=%s",
+        ip_endp_ntop(new_pcb->local, ep1, sizeof(ep1)),
+        ip_endp_ntop(new_pcb->remote, ep2, sizeof(ep2)));
+    lock_release(&lock);
+    return new_desc;
 }
 
 ssize_t
