@@ -17,8 +17,8 @@
 #define SOCK_STREAM 1
 #define SOCK_DGRAM  2
 
-#define IPPROTO_TCP 0
-#define IPPROTO_UDP 0
+#define IPPROTO_TCP 6
+#define IPPROTO_UDP 17
 
 #define INADDR_ANY IP_ADDR_ANY
 
